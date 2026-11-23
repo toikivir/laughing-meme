@@ -9,17 +9,27 @@
 
 ## Active task
 
-**EverFunded YouTube review video — DELIVERED.**
+**EverFunded YouTube review video — v2 DELIVERED (real screen captures).**
 
 - Deliverable: `video/out/everfunded_account_comparison.mp4`
   - 1920x1080, 30 fps, H.264 + AAC stereo
-  - 545.5 s (**9:05**, inside the requested 8–10 min)
+  - 539.9 s (**9:00**, inside the requested 8–10 min)
   - Captions burned in (`ass=`), motion-graphics slides, TTS narration, synth music + SFX
-  - Integrated loudness **-16.4 LUFS**, true peak **-1.4 dBFS**, 16.9 MB
+  - Integrated loudness **-16.4 LUFS**, true peak **-1.27 dBTP**, 17.2 MB
+  - **Real captures (user correction "You have to screen capture"):**
+    - c02 overview slide = real everfunded.com "Choose Your EverFunded Challenge"
+      comparison table (`video/assets/captures/comparison_table.png`, from
+      Walkthrough-Final 562 s)
+    - c08 dashboard segment = 27 s of genuine `app.everfunded.com` dashboard footage
+      (`video/assets/captures/dashboard_demo.mp4`, from Walkthrough-Final 505–535 s)
+    - c10 CTA slide = real checkout capture with GEOID applied
+      (`video/assets/captures/checkout_panel.png`)
+    - slide 12 objectives = faithful reproduction of real dashboard labels/values
 - Uploaded to Google Drive folder **`Agent Everfunded`**
   - folder id `13w8UZ7P1nS0JNT9XKt6oYUwmMxh4iuzk`
-  - file id `1PrQA8haR1xgYcS_QSNpFJ0VBOeVY-0Qm`
-  - https://drive.google.com/file/d/1PrQA8haR1xgYcS_QSNpFJ0VBOeVY-0Qm/view
+  - v2 file id `1uoBHjJSyp8EalAfZ7wF5UObdDfRweWqg`
+  - https://drive.google.com/file/d/1uoBHjJSyp8EalAfZ7wF5UObdDfRweWqg/view
+  - v1 (mockups) file id `1PrQA8haR1xgYcS_QSNpFJ0VBOeVY-0Qm` — superseded
 
 ## Video structure (15 slides -> 10 narration chunks)
 
