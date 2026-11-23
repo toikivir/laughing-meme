@@ -1,0 +1,524 @@
+// fallow-ignore-file code-duplication
+import { spawnSync } from "node:child_process";
+import { readdirSync, readFileSync } from "node:fs";
+import { cpus } from "node:os";
+import { join, sep } from "node:path";
+import { afterEach, beforeEach, describe, it, expect, vi } from "vitest";
+import {
+  _resetCgroupLimitCacheForTests,
+  isLowMemorySystem,
+  parseCgroupCpus,
+  LOW_MEMORY_TOTAL_MB_THRESHOLD,
+  parseCgroupLimitMb,
+} from "./systemMemory.js";
+
+const BYTES_PER_MIB = 1024 * 1024;
+const CGROUP_V2_MEMORY_MAX_PATH = "/sys/fs/cgroup/memory.max";
+const CGROUP_V1_MEMORY_LIMIT_PATH = "/sys/fs/cgroup/memory/memory.limit_in_bytes";
+
+type SystemMemoryModule = typeof import("./systemMemory.js");
+
+type MockSystemMemoryOptions = {
+  availableParallelism?: number;
+  hostCpus?: number;
+  files?: Record<string, string>;
+  hostTotalMb?: number;
+  platform?: NodeJS.Platform;
+  readErrors?: Record<string, NodeJS.ErrnoException>;
+  onRead?: (path: string) => void;
+  throwOnFileRead?: boolean;
+};
+
+function stubPlatform(platform: NodeJS.Platform): () => void {
+  const descriptor = Object.getOwnPropertyDescriptor(process, "platform");
+  Object.defineProperty(process, "platform", { value: platform });
+
+  return () => {
+    if (descriptor) {
+      Object.defineProperty(process, "platform", descriptor);
+    }
+  };
+}
+
+async function withSystemMemoryMocks(
+  options: MockSystemMemoryOptions,
+  run: (systemMemory: SystemMemoryModule) => void | Promise<void>,
+): Promise<void> {
+  const {
+    availableParallelism = 32,
+    hostCpus = 32,
+    files = {},
+    hostTotalMb = 32768,
+    platform = "linux",
+    readErrors = {},
+    onRead,
+    throwOnFileRead = false,
+  } = options;
+  const restorePlatform = stubPlatform(platform);
+
+  vi.resetModules();
+  vi.doMock("os", () => ({
+    availableParallelism: () => availableParallelism,
+    cpus: () => Array.from({ length: hostCpus }, () => ({})),
+    totalmem: () => hostTotalMb * BYTES_PER_MIB,
+  }));
+  vi.doMock("fs", () => ({
+    readFileSync: (path: string) => {
+      onRead?.(path);
+
+      if (throwOnFileRead) {
+        throw new Error(`/sys read should not happen: ${path}`);
+      }
+
+      if (path in readErrors) {
+        throw readErrors[path];
+      }
+
+      if (path in files) {
+        return files[path];
+      }
+
+      throw Object.assign(new Error("missing cgroup file"), { code: "ENOENT" });
+    },
+  }));
+
+  try {
+    const systemMemory = await import("./systemMemory.js");
+    systemMemory._resetCgroupLimitCacheForTests();
+    await run(systemMemory);
+  } finally {
+    vi.doUnmock("fs");
+    vi.doUnmock("os");
+    vi.resetModules();
+    restorePlatform();
+  }
+}
+
+beforeEach(() => {
+  _resetCgroupLimitCacheForTests();
+});
+
+afterEach(() => {
+  _resetCgroupLimitCacheForTests();
+  vi.restoreAllMocks();
+});
+
+describe("isLowMemorySystem", () => {
+  it("treats sub-threshold RAM as low-memory", () => {
+    expect(isLowMemorySystem(4096)).toBe(true);
+    expect(isLowMemorySystem(6000)).toBe(true);
+    expect(isLowMemorySystem(7600)).toBe(true);
+  });
+
+  it("includes machines reporting exactly the threshold (8 GB boundary)", () => {
+    // Real "8 GB" hosts report at/just under 8192 MiB after firmware/iGPU
+    // reservations — the inclusive bound is the whole point (issue #1219).
+    expect(isLowMemorySystem(LOW_MEMORY_TOTAL_MB_THRESHOLD)).toBe(true);
+    expect(isLowMemorySystem(8192)).toBe(true);
+  });
+
+  it("treats above-threshold RAM as normal", () => {
+    expect(isLowMemorySystem(8193)).toBe(false);
+    expect(isLowMemorySystem(16384)).toBe(false);
+    expect(isLowMemorySystem(65536)).toBe(false);
+  });
+
+  it("treats a 4 GiB cgroup v2 limit on a 32 GiB host as low-memory", async () => {
+    await withSystemMemoryMocks(
+      {
+        files: {
+          [CGROUP_V2_MEMORY_MAX_PATH]: `${4096 * BYTES_PER_MIB}`,
+        },
+      },
+      ({ getSystemTotalMb, isLowMemorySystem }) => {
+        expect(getSystemTotalMb()).toBe(4096);
+        expect(isLowMemorySystem()).toBe(true);
+      },
+    );
+  });
+});
+
+describe("parseCgroupLimitMb", () => {
+  it("parses cgroup v2 numeric limits", () => {
+    expect(parseCgroupLimitMb(`${4096 * BYTES_PER_MIB}`, null)).toBe(4096);
+  });
+
+  it('ignores cgroup v2 "max" limits', () => {
+    expect(parseCgroupLimitMb("max", null)).toBeNull();
+  });
+
+  it("parses cgroup v1 numeric limits and ignores no-limit sentinels", () => {
+    expect(parseCgroupLimitMb(null, `${6144 * BYTES_PER_MIB}`)).toBe(6144);
+    expect(parseCgroupLimitMb(null, "9223372036854771712")).toBeNull();
+  });
+
+  it("ignores absent and malformed limits", () => {
+    expect(parseCgroupLimitMb(null, null)).toBeNull();
+
+    for (const content of ["", "garbage", "-1", "0"]) {
+      expect(parseCgroupLimitMb(content, null)).toBeNull();
+      expect(parseCgroupLimitMb(null, content)).toBeNull();
+    }
+  });
+
+  it("uses cgroup v2 when both v2 and v1 contents are present", () => {
+    expect(parseCgroupLimitMb(`${4096 * BYTES_PER_MIB}`, `${2048 * BYTES_PER_MIB}`)).toBe(4096);
+  });
+});
+
+describe("parseCgroupCpus", () => {
+  it("reads a v2 cpu.max quota as CPUs", () => {
+    expect(parseCgroupCpus("350000 100000\n", null, null)).toBe(3.5);
+    expect(parseCgroupCpus("max 100000", null, null)).toBeNull();
+  });
+
+  it("reads a v1 quota over its period, and -1 as no quota", () => {
+    expect(parseCgroupCpus(null, "400000\n", "100000\n")).toBe(4);
+    expect(parseCgroupCpus(null, "-1", "100000")).toBeNull();
+  });
+
+  it("ignores absent and malformed quotas", () => {
+    expect(parseCgroupCpus(null, null, null)).toBeNull();
+    for (const content of ["", "garbage", "0 100000", "100000 0"])
+      expect(parseCgroupCpus(content, null, null)).toBeNull();
+  });
+});
+
+describe("getCgroupCpuLimit", () => {
+  it("reads the quota from cpu.max, and none from a host without one", async () => {
+    await withSystemMemoryMocks(
+      { files: { "/sys/fs/cgroup/cpu.max": "350000 100000" } },
+      ({ getCgroupCpuLimit }) => expect(getCgroupCpuLimit()).toBe(3.5),
+    );
+    await withSystemMemoryMocks(
+      { files: { "/sys/fs/cgroup/cpu.max": "max 100000" } },
+      ({ getCgroupCpuLimit }) => expect(getCgroupCpuLimit()).toBeNull(),
+    );
+    await withSystemMemoryMocks({ platform: "darwin" }, ({ getCgroupCpuLimit }) =>
+      expect(getCgroupCpuLimit()).toBeNull(),
+    );
+  });
+});
+
+describe("usableCpuCount under a CPU quota", () => {
+  // Node 22.23 (libuv 1.51) clamps availableParallelism() to a cgroup v2 quota, as on a Kubernetes CPU limit.
+  const quotaOfSix = {
+    availableParallelism: 6,
+    files: { "/sys/fs/cgroup/cpu.max": "600000 100000" },
+  };
+
+  it("is the affinity count, leaving the quota to getCgroupCpuLimit", async () => {
+    await withSystemMemoryMocks(
+      {
+        ...quotaOfSix,
+        files: {
+          ...quotaOfSix.files,
+          "/proc/self/status": "Name:\tnode\nCpus_allowed_list:\t0-31\n",
+        },
+      },
+      ({ usableCpuCount, getCgroupCpuLimit }) => {
+        expect(usableCpuCount()).toBe(32);
+        expect(getCgroupCpuLimit()).toBe(6);
+      },
+    );
+  });
+
+  it("is a cpuset's count when a cpuset and a quota both apply", async () => {
+    await withSystemMemoryMocks(
+      {
+        ...quotaOfSix,
+        files: { ...quotaOfSix.files, "/proc/self/status": "Cpus_allowed_list:\t0-3,8,10-11\n" },
+      },
+      ({ usableCpuCount }) => expect(usableCpuCount()).toBe(7),
+    );
+  });
+
+  it("never counts more CPUs than the host has online", async () => {
+    await withSystemMemoryMocks(
+      {
+        ...quotaOfSix,
+        hostCpus: 16,
+        files: { ...quotaOfSix.files, "/proc/self/status": "Cpus_allowed_list:\t0-63\n" },
+      },
+      ({ usableCpuCount }) => expect(usableCpuCount()).toBe(16),
+    );
+  });
+
+  it("leaves cpuBudget at the quota's whole CPUs", async () => {
+    await withSystemMemoryMocks(
+      {
+        files: {
+          "/sys/fs/cgroup/cpu.max": "350000 100000",
+          "/proc/self/status": "Cpus_allowed_list:\t0-31\n",
+        },
+      },
+      ({ cpuBudget, usableCpuCount }) => {
+        expect(usableCpuCount()).toBe(32);
+        expect(cpuBudget()).toBe(3);
+      },
+    );
+  });
+
+  it("falls back to availableParallelism when the affinity list is unreadable", async () => {
+    await withSystemMemoryMocks(quotaOfSix, ({ usableCpuCount }) =>
+      expect(usableCpuCount()).toBe(6),
+    );
+  });
+});
+
+describe("getCgroupMemoryLimitMb", () => {
+  it("returns only an actual cgroup limit and never host RAM", async () => {
+    await withSystemMemoryMocks(
+      {
+        files: { [CGROUP_V2_MEMORY_MAX_PATH]: `${24576 * BYTES_PER_MIB}` },
+        hostTotalMb: 65536,
+      },
+      ({ getCgroupMemoryLimitMb }) => {
+        expect(getCgroupMemoryLimitMb()).toBe(24576);
+      },
+    );
+
+    await withSystemMemoryMocks(
+      {
+        files: { [CGROUP_V2_MEMORY_MAX_PATH]: "max" },
+        hostTotalMb: 65536,
+      },
+      ({ getCgroupMemoryLimitMb }) => {
+        expect(getCgroupMemoryLimitMb()).toBeNull();
+      },
+    );
+  });
+});
+
+describe("getSystemTotalMb", () => {
+  it("caches cgroup probes until the test reset hook clears the cache", async () => {
+    const readCalls: string[] = [];
+    const files = {
+      [CGROUP_V2_MEMORY_MAX_PATH]: `${4096 * BYTES_PER_MIB}`,
+    };
+
+    await withSystemMemoryMocks(
+      {
+        files,
+        onRead: (path) => readCalls.push(path),
+      },
+      ({ _resetCgroupLimitCacheForTests, getSystemTotalMb }) => {
+        expect(getSystemTotalMb()).toBe(4096);
+        expect(getSystemTotalMb()).toBe(4096);
+        expect(readCalls).toEqual([CGROUP_V2_MEMORY_MAX_PATH]);
+
+        files[CGROUP_V2_MEMORY_MAX_PATH] = `${2048 * BYTES_PER_MIB}`;
+        _resetCgroupLimitCacheForTests();
+
+        expect(getSystemTotalMb()).toBe(2048);
+        expect(readCalls).toEqual([CGROUP_V2_MEMORY_MAX_PATH, CGROUP_V2_MEMORY_MAX_PATH]);
+      },
+    );
+  });
+
+  it('uses the host total when cgroup v2 reports "max"', async () => {
+    await withSystemMemoryMocks(
+      {
+        files: {
+          [CGROUP_V2_MEMORY_MAX_PATH]: "max",
+        },
+      },
+      ({ getSystemTotalMb, isLowMemorySystem }) => {
+        expect(getSystemTotalMb()).toBe(32768);
+        expect(isLowMemorySystem()).toBe(false);
+      },
+    );
+  });
+
+  it("honors cgroup v1 numeric limits when cgroup v2 is absent", async () => {
+    await withSystemMemoryMocks(
+      {
+        files: {
+          [CGROUP_V1_MEMORY_LIMIT_PATH]: `${6144 * BYTES_PER_MIB}`,
+        },
+      },
+      ({ getSystemTotalMb, isLowMemorySystem }) => {
+        expect(getSystemTotalMb()).toBe(6144);
+        expect(isLowMemorySystem()).toBe(true);
+      },
+    );
+  });
+
+  it("uses the host total when cgroup v1 reports a no-limit sentinel", async () => {
+    await withSystemMemoryMocks(
+      {
+        files: {
+          [CGROUP_V1_MEMORY_LIMIT_PATH]: "9223372036854771712",
+        },
+      },
+      ({ getSystemTotalMb, isLowMemorySystem }) => {
+        expect(getSystemTotalMb()).toBe(32768);
+        expect(isLowMemorySystem()).toBe(false);
+      },
+    );
+  });
+
+  it("uses the host total when cgroup files are absent", async () => {
+    await withSystemMemoryMocks({}, ({ getSystemTotalMb, isLowMemorySystem }) => {
+      expect(getSystemTotalMb()).toBe(32768);
+      expect(isLowMemorySystem()).toBe(false);
+    });
+  });
+
+  it("warns once and uses the host total when a cgroup file is unreadable", async () => {
+    const warn = vi.spyOn(console, "warn").mockImplementation(() => {});
+    await withSystemMemoryMocks(
+      {
+        readErrors: {
+          [CGROUP_V2_MEMORY_MAX_PATH]: Object.assign(new Error("permission denied"), {
+            code: "EACCES",
+          }),
+        },
+      },
+      ({ getSystemTotalMb, isLowMemorySystem }) => {
+        expect(getSystemTotalMb()).toBe(32768);
+        expect(getSystemTotalMb()).toBe(32768);
+        expect(isLowMemorySystem()).toBe(false);
+        expect(warn).toHaveBeenCalledTimes(1);
+        expect(warn.mock.calls[0]?.[0]).toContain(
+          "[SystemMemory] Unable to read cgroup memory limit",
+        );
+        expect(warn.mock.calls[0]?.[0]).toContain("EACCES");
+      },
+    );
+  });
+
+  it("logs the cgroup-limit notice to stderr, not stdout (keeps --json output clean)", async () => {
+    const warn = vi.spyOn(console, "warn").mockImplementation(() => {});
+    const info = vi.spyOn(console, "info").mockImplementation(() => {});
+    const log = vi.spyOn(console, "log").mockImplementation(() => {});
+    await withSystemMemoryMocks(
+      {
+        files: {
+          [CGROUP_V2_MEMORY_MAX_PATH]: `${4096 * BYTES_PER_MIB}`,
+        },
+      },
+      ({ getSystemTotalMb }) => {
+        expect(getSystemTotalMb()).toBe(4096);
+        expect(warn).toHaveBeenCalledTimes(1);
+        expect(warn.mock.calls[0]?.[0]).toContain("[SystemMemory] cgroup memory limit detected");
+        // stdout must stay clean so `check --json` output is machine-parseable.
+        expect(info).not.toHaveBeenCalled();
+        expect(log).not.toHaveBeenCalled();
+      },
+    );
+  });
+
+  it("stays silent when cgroup files are absent", async () => {
+    const warn = vi.spyOn(console, "warn").mockImplementation(() => {});
+    await withSystemMemoryMocks({}, ({ getSystemTotalMb }) => {
+      expect(getSystemTotalMb()).toBe(32768);
+      expect(getSystemTotalMb()).toBe(32768);
+      expect(warn).not.toHaveBeenCalled();
+    });
+  });
+
+  it.each(["", "garbage", "-1", "0"])(
+    "uses the host total for malformed cgroup v2 content %j",
+    async (content) => {
+      await withSystemMemoryMocks(
+        {
+          files: {
+            [CGROUP_V2_MEMORY_MAX_PATH]: content,
+          },
+        },
+        ({ getSystemTotalMb, isLowMemorySystem }) => {
+          expect(getSystemTotalMb()).toBe(32768);
+          expect(isLowMemorySystem()).toBe(false);
+        },
+      );
+    },
+  );
+
+  it.each(["", "garbage", "-1", "0"])(
+    "uses the host total for malformed cgroup v1 content %j",
+    async (content) => {
+      await withSystemMemoryMocks(
+        {
+          files: {
+            [CGROUP_V1_MEMORY_LIMIT_PATH]: content,
+          },
+        },
+        ({ getSystemTotalMb, isLowMemorySystem }) => {
+          expect(getSystemTotalMb()).toBe(32768);
+          expect(isLowMemorySystem()).toBe(false);
+        },
+      );
+    },
+  );
+
+  it("uses the host total when a cgroup limit is larger than host RAM", async () => {
+    await withSystemMemoryMocks(
+      {
+        files: {
+          [CGROUP_V2_MEMORY_MAX_PATH]: `${65536 * BYTES_PER_MIB}`,
+        },
+      },
+      ({ getSystemTotalMb, isLowMemorySystem }) => {
+        expect(getSystemTotalMb()).toBe(32768);
+        expect(isLowMemorySystem()).toBe(false);
+      },
+    );
+  });
+
+  it("does not read cgroup files on non-Linux platforms", async () => {
+    await withSystemMemoryMocks(
+      {
+        platform: "darwin",
+        throwOnFileRead: true,
+      },
+      ({ getSystemTotalMb, isLowMemorySystem }) => {
+        expect(getSystemTotalMb()).toBe(32768);
+        expect(isLowMemorySystem()).toBe(false);
+      },
+    );
+  });
+});
+
+const hasTaskset = process.platform === "linux" && spawnSync("taskset", ["-V"]).status === 0;
+
+describe.skipIf(!hasTaskset)("usableCpuCount under a cpuset", () => {
+  it("is the CPUs the process may run on, while hostCpuCount stays the machine's", () => {
+    const run = spawnSync(
+      "taskset",
+      [
+        ...["-c", "0", process.execPath, "--experimental-strip-types", "--no-warnings", "-e"],
+        `import(${JSON.stringify(join(import.meta.dirname, "systemMemory.ts"))})` +
+          ".then((m) => console.log(m.usableCpuCount(), m.hostCpuCount()))",
+      ],
+      { encoding: "utf8" },
+    );
+    expect(run.stderr).toBe("");
+    expect(run.stdout.trim()).toBe(`1 ${cpus().length}`);
+  });
+});
+
+describe("work is sized by usableCpuCount", () => {
+  it("leaves os.cpus() to systemMemory.ts in engine and producer sources", () => {
+    const packages = join(import.meta.dirname, "../../..");
+    const callers: string[] = [];
+    const walk = (dir: string): void => {
+      for (const entry of readdirSync(dir, { withFileTypes: true })) {
+        const path = join(dir, entry.name);
+        if (entry.isDirectory()) walk(path);
+        else if (/\.ts$/.test(entry.name) && !/\.test\.ts$/.test(entry.name)) {
+          if (/\bcpus\(\)/.test(readFileSync(path, "utf8")))
+            callers.push(
+              path
+                .slice(packages.length + 1)
+                .split(sep)
+                .join("/"),
+            );
+        }
+      }
+    };
+    walk(join(packages, "engine/src"));
+    walk(join(packages, "producer/src"));
+    expect(callers).toEqual(["engine/src/services/systemMemory.ts"]);
+  });
+});

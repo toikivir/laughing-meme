@@ -1,0 +1,463 @@
+import { existsSync, readFileSync, statSync } from "node:fs";
+import { join } from "node:path";
+import { parseHTML } from "linkedom";
+import { firstHtmlTemplate } from "@hyperframes/parsers/sub-composition-validity";
+import { decodedUrlPath } from "@hyperframes/parsers/asset-paths";
+import {
+  rewriteAssetPaths,
+  rewriteCssAssetUrls,
+  rewriteInlineStyleAssetUrls,
+} from "@hyperframes/core";
+import {
+  deferScriptsUntilFonts,
+  RUNTIME_BOOTSTRAP_ATTR,
+  stripEmbeddedRuntimeScripts,
+} from "@hyperframes/core/compiler";
+import { findStartTags, isFullHtmlDocument } from "@hyperframes/core/compiler/html-document";
+import { gsapCdnDist } from "@hyperframes/core/gsap-cdn";
+import { resolveWithinProject } from "@hyperframes/core/safe-path";
+import {
+  assertCompositionFileSize,
+  CompositionExpansionBudget,
+} from "@hyperframes/core/compiler/composition-size-limit";
+import { TIMELINE_REGISTRY_SCRIPT } from "./authoredCode.js";
+import { htmlHasGsapCore, insertGsapCoreBeforeHeadPlugin } from "./gsapCoreScript.js";
+import { withRootPathsRelative } from "./rootPaths.js";
+
+/**
+ * Rewrite relative asset paths in a parsed DOM tree. Shared across all
+ * three dispatch branches (template, full-doc, fragment) to avoid drift.
+ *
+ * The preview page borrows the project-root `<base>`, so a composition at
+ * `design/styleframes/frame-01.html` referencing its sibling `_shared.css` was
+ * requested as `/preview/_shared.css` (404). The frame then rendered unstyled,
+ * which the thumbnailer's transparent-body fallback painted dark navy — the
+ * "illegible styleframe thumbnail" bug. The `assetExists` probe re-points such
+ * refs at the composition's own directory; see `rewriteAssetPath`.
+ */
+function rewriteRelativePaths(root: ParentNode, compPath: string, projectDir: string): void {
+  const assetExists = (path: string) => existsSync(join(projectDir, path));
+  rewriteAssetPaths(
+    root.querySelectorAll("[src], [href], [srcset]"),
+    compPath,
+    (el: Element, attr: string) => el.getAttribute(attr),
+    (el: Element, attr: string, value: string) => el.setAttribute(attr, value),
+    assetExists,
+  );
+  rewriteInlineStyleAssetUrls(
+    root.querySelectorAll("[style]"),
+    compPath,
+    (el: Element) => el.getAttribute("style"),
+    (el: Element, value: string) => el.setAttribute("style", value),
+    assetExists,
+  );
+  for (const styleEl of root.querySelectorAll("style")) {
+    styleEl.textContent = rewriteCssAssetUrls(styleEl.textContent || "", compPath, assetExists);
+  }
+}
+
+/**
+ * Escape a CSS identifier whose first character is a digit so it is a valid
+ * selector. A CSS ident cannot start with a digit, so it must be written as an
+ * escaped code point: `01-foo` → `\30 1-foo` (leading `0` → `\30 `, rest kept).
+ *
+ * Only the leading digit needs escaping (per CSS Syntax Level 3 §4.3.11): once
+ * the parser consumes the `\<hex> ` escape, the rest of the ident continues
+ * normally, so `123-scene` → `\31 23-scene` is valid (the `23-scene` tail is
+ * consumed as identifier continuation). The trailing space terminates the hex
+ * escape so a following hex digit isn't folded into the code point.
+ */
+function escapeLeadingDigitIdent(id: string): string {
+  return `\\${id.charCodeAt(0).toString(16)} ${id.slice(1)}`;
+}
+
+const REGEXP_SPECIALS = /[.*+?^${}()|[\]\\]/g;
+
+/**
+ * Fix `#<digit-leading-id>` selectors in the tree's `<style>` blocks.
+ *
+ * CSS identifiers cannot start with a digit, so an authored rule like
+ * `#01-wall-pushes-back { width: 1920px; height: 1080px; background: #F0EBDE }`
+ * is an invalid selector and the browser silently drops the WHOLE rule — taking
+ * the root's size and background with it. In a full composition the frame is
+ * stretched/painted by its `data-composition-src` host so the collapse is
+ * masked, but a standalone preview has no host: the root falls back to
+ * `height: 0` + transparent and the frame renders blank (black).
+ *
+ * Rewrite each such selector to its escaped, valid form (`#\30 1-wall-pushes-back`,
+ * which still matches `id="01-wall-pushes-back"`) so the rule applies and the
+ * whole declaration block — size, background, position, container-type — comes
+ * back. Scoped to ids that are actually present on elements in the content and
+ * matched only as `#id` not followed by another ident char, so hex colors
+ * (`#1F2BE0`) and other values are never touched (they are not element ids).
+ */
+function fixDigitLeadingIdSelectors(root: ParentNode): void {
+  const digitIds = new Set<string>();
+  for (const el of root.querySelectorAll("[id]")) {
+    const id = el.getAttribute("id");
+    if (id && /^\d/.test(id)) digitIds.add(id);
+  }
+  if (digitIds.size === 0) return;
+
+  for (const styleEl of root.querySelectorAll("style")) {
+    let css = styleEl.textContent || "";
+    for (const id of digitIds) {
+      const pattern = new RegExp(`#${id.replace(REGEXP_SPECIALS, "\\$&")}(?![\\w-])`, "g");
+      css = css.replace(pattern, `#${escapeLeadingDigitIdent(id)}`);
+    }
+    styleEl.textContent = css;
+  }
+}
+
+/**
+ * Parse a full HTML document and extract its head elements and body
+ * content separately, so they can be reassembled into a clean standalone
+ * page without nesting `<html>` inside `<body>`.
+ *
+ * Extracts the full innerHTML of `<head>` — this preserves `<style>`,
+ * `<script>`, `<link>`, `<meta>`, and any other head-level tags the
+ * composition declares. Dropping `<link rel="stylesheet">` or `<meta>`
+ * would cause silent rendering failures for compositions that ship with
+ * external CSS or viewport-dependent meta.
+ *
+ * `<html>` and `<body>` attributes (lang, class, data-*) are extracted
+ * so callers can forward them to the assembled page.
+ */
+function extractFullDocumentParts(
+  rawHtml: string,
+  compPath: string,
+  projectDir: string,
+): {
+  headContent: string;
+  bodyContent: string;
+  htmlAttrs: string;
+  bodyAttrs: string;
+} {
+  const { document: doc } = parseHTML(rawHtml);
+
+  const rewriteTargets = [doc.head, doc.body].filter(Boolean);
+  for (const target of rewriteTargets) {
+    rewriteRelativePaths(target, compPath, projectDir);
+  }
+  // Run on the whole document: ids live in <body> but their rules may live in
+  // a <head> <style>, so the scope must span both.
+  fixDigitLeadingIdSelectors(doc);
+
+  const headContent = doc.head?.innerHTML ?? "";
+  const bodyContent = doc.body?.innerHTML ?? "";
+
+  const htmlEl = doc.documentElement;
+  const htmlAttrs = extractElementAttrs(htmlEl);
+  const bodyAttrs = doc.body ? extractElementAttrs(doc.body) : "";
+
+  return { headContent, bodyContent, htmlAttrs, bodyAttrs };
+}
+
+/**
+ * Extract the inner HTML of the composition's wrapping `<template>` element, or
+ * `null` if the source has no `<template>`.
+ *
+ * Located via the DOM rather than a regex. A greedy
+ * `/<template[^>]*>([\s\S]*)<\/template>/` can latch onto a literal
+ * `"<template>"` that appears inside an HTML comment — e.g. a head note such as
+ * "the HF runtime clones ONLY <template> contents" — and mis-slice the capture,
+ * leaving the real composition content re-wrapped in an inert `<template>` in
+ * the output. That template is never rendered by the browser, so the standalone
+ * preview has no `[data-composition-id]` element and no registered timeline, and
+ * renders blank. `querySelector("template")` only ever matches a real element
+ * node, so comment text can't fool it.
+ */
+function extractTemplate(
+  rawComp: string,
+): { innerHtml: string; compositionId: string | null } | null {
+  const { document: doc } = parseHTML(rawComp);
+  const template = firstHtmlTemplate(doc.querySelectorAll("template"));
+  if (!template) return null;
+  return {
+    innerHtml: template.innerHTML,
+    compositionId: template.getAttribute("data-composition-id"),
+  };
+}
+
+/** Attribute values read from the DOM are decoded — re-escape on rebuild or
+ *  quote-bearing values (data-composition-variables is a JSON array) shred
+ *  the wrapper's markup into bogus attributes. */
+function escapeAttrValue(value: string): string {
+  return value.replace(/&/g, "&amp;").replace(/"/g, "&quot;");
+}
+
+function extractElementAttrs(el: Element): string {
+  const parts: string[] = [];
+  for (let i = 0; i < el.attributes.length; i++) {
+    const attr = el.attributes[i]!;
+    if (attr.value === "") {
+      parts.push(attr.name);
+    } else {
+      parts.push(`${attr.name}="${escapeAttrValue(attr.value)}"`);
+    }
+  }
+  return parts.join(" ");
+}
+
+const NON_RENDERED_TAGS = new Set(["SCRIPT", "STYLE", "LINK", "META", "TEMPLATE", "NOSCRIPT"]);
+
+/**
+ * Carry the `<template>`'s `data-composition-id` onto the content's root
+ * rendered element when the author declared it only on the `<template>` tag.
+ *
+ * In a full composition, each sub-composition is mounted under a wrapper
+ * element (the `data-composition-src` host) that carries the composition id,
+ * which is how the runtime binds `window.__timelines[id]` into the player's
+ * master timeline. A standalone preview has no such wrapper, so it relies on
+ * the frame's own root element carrying `data-composition-id`. If the id lives
+ * only on the inert `<template>` tag (a common authoring pattern), the rendered
+ * body has no `[data-composition-id]` element — the runtime then never selects
+ * a root composition, the registered GSAP timeline stays unbound, and seeking
+ * does nothing. The frame renders at its pre-animation state (GSAP `fromTo`
+ * pins `opacity:0`), producing a blank preview/thumbnail.
+ *
+ * This is a no-op when the content already exposes a `[data-composition-id]`
+ * element (e.g. the id is authored on the root div), so compositions that
+ * already render correctly are untouched.
+ */
+function promoteTemplateCompositionId(templateCompositionId: string | null, body: Element): void {
+  if (!templateCompositionId) return;
+  if (body.querySelector("[data-composition-id]")) return;
+
+  const root = Array.from(body.children).find((el) => !NON_RENDERED_TAGS.has(el.tagName));
+  root?.setAttribute("data-composition-id", templateCompositionId);
+}
+
+/**
+ * Add `data-composition-file="<compPath>"` to the comp's root composition
+ * element (the first `[data-composition-id]` that lacks the attribute), so the
+ * studio resolves its top-level elements to the right source file. Idempotent;
+ * a no-op when no composition element is present.
+ */
+export function tagRootCompositionFile(bodyHtml: string, compPath: string): string {
+  const tag = firstCompositionIdTag(bodyHtml);
+  if (!tag) return bodyHtml;
+  if (bodyHtml.slice(tag.start, tag.end).includes("data-composition-file")) return bodyHtml;
+  return (
+    bodyHtml.slice(0, tag.end) +
+    ` data-composition-file="${escapeAttrValue(compPath)}"` +
+    bodyHtml.slice(tag.end)
+  );
+}
+
+const TAG_OPENER = /<[a-zA-Z]/g;
+const COMPOSITION_ID_ATTR = "data-composition-id=";
+
+/**
+ * The first start tag with a `data-composition-id=` attribute, from its `<` to its `>`: the tag
+ * `/<[a-zA-Z][^>]*\bdata-composition-id=/` finds, in time linear in the page. That regex rescans to
+ * the next `>` from every opener, which is quadratic on a long run of openers with no `>`. An opener
+ * inside another opener's tag can only do worse than that opener, so each tag is checked once.
+ * Null when there is no such tag, or it never closes.
+ */
+function firstCompositionIdTag(html: string): { start: number; end: number } | null {
+  TAG_OPENER.lastIndex = 0;
+  for (let open = TAG_OPENER.exec(html); open; open = TAG_OPENER.exec(html)) {
+    const close = html.indexOf(">", open.index);
+    const tag = html.slice(open.index, close === -1 ? html.length : close);
+    if (hasBoundedAttr(tag, COMPOSITION_ID_ATTR, 2)) {
+      return close === -1 ? null : { start: open.index, end: close };
+    }
+    if (close === -1) return null;
+    TAG_OPENER.lastIndex = close;
+  }
+  return null;
+}
+
+/** Whether `name` appears in `tag` at or after `from` with a non-word character before it, as `\bname` would. */
+function hasBoundedAttr(tag: string, name: string, from: number): boolean {
+  for (let at = tag.indexOf(name, from); at !== -1; at = tag.indexOf(name, at + 1)) {
+    if (!/\w/.test(tag[at - 1] ?? "")) return true;
+  }
+  return false;
+}
+
+const HEAD_OPENER = /<head/gi;
+const HEAD_CLOSER = /<\/head>/gi;
+
+/**
+ * The inner HTML of the page's `<head>`: what `/<head[^>]*>([\s\S]*?)<\/head>/i` captures, in time
+ * linear in the page. That regex rescans to the end of the page from every `<head` opener when the
+ * `>` or the `</head>` is missing. Only the first opener can match: a later one has no `>` or
+ * `</head>` that the first could not also use.
+ */
+export function rootHeadContent(rootHtml: string): string {
+  HEAD_OPENER.lastIndex = 0;
+  const open = HEAD_OPENER.exec(rootHtml);
+  if (!open) return "";
+  const gt = rootHtml.indexOf(">", open.index + open[0].length);
+  if (gt === -1) return "";
+  HEAD_CLOSER.lastIndex = gt + 1;
+  const close = HEAD_CLOSER.exec(rootHtml);
+  return close ? rootHtml.slice(gt + 1, close.index) : "";
+}
+
+/**
+ * Build a standalone HTML page for a sub-composition.
+ *
+ * Uses the project's own index.html `<head>` so all dependencies (GSAP, fonts,
+ * Lottie, reset styles, runtime) are preserved — instead of building a minimal
+ * page from scratch that would miss important scripts/styles.
+ *
+ * Three dispatch modes, tried in order:
+ *   1. `<template>` wrapper → extract template content (existing compositions)
+ *   2. Full HTML document → parse and extract head/body separately (registry blocks)
+ *   3. Raw fragment → wrap in a minimal document
+ *
+ * For full-doc mode, the composition's own `<head>` content (styles, scripts,
+ * links, meta) is appended AFTER the project's index.html head. When both
+ * declare the same dependency (e.g. GSAP CDN), the composition's copy wins
+ * by last-write-wins script execution order — this is intentional so the
+ * composition can pin a specific version.
+ */
+export function buildSubCompositionHtml(
+  projectDir: string,
+  compPath: string,
+  runtimeUrl: string,
+  baseHref?: string,
+  rawOverride?: string,
+  gsapBaseUrl?: string,
+): string | null {
+  const compFile = resolveWithinProject(projectDir, compPath);
+  if (!compFile || !existsSync(compFile)) return null;
+
+  // rawOverride lets the preview route thread the hf-id-stamped content in
+  // directly, so the build uses ids minted from the raw file, which is never
+  // written by serving.
+  const rawComp = rawOverride ?? readFileSync(compFile, "utf-8");
+
+  let compHeadContent = "";
+  let rewrittenContent: string;
+  let htmlAttrs = "";
+  let bodyAttrs = "";
+
+  const template = extractTemplate(rawComp);
+
+  if (template) {
+    const { document: contentDoc } = parseHTML(
+      `<!DOCTYPE html><html><head></head><body>${template.innerHtml}</body></html>`,
+    );
+    rewriteRelativePaths(contentDoc, compPath, projectDir);
+    fixDigitLeadingIdSelectors(contentDoc);
+    promoteTemplateCompositionId(template.compositionId, contentDoc.body);
+    rewrittenContent = contentDoc.body.innerHTML || template.innerHtml;
+  } else if (isFullHtmlDocument(rawComp)) {
+    const parts = extractFullDocumentParts(rawComp, compPath, projectDir);
+    compHeadContent = parts.headContent;
+    rewrittenContent = parts.bodyContent;
+    htmlAttrs = parts.htmlAttrs;
+    bodyAttrs = parts.bodyAttrs;
+  } else {
+    const { document: contentDoc } = parseHTML(
+      `<!DOCTYPE html><html><head></head><body>${rawComp}</body></html>`,
+    );
+    rewriteRelativePaths(contentDoc, compPath, projectDir);
+    fixDigitLeadingIdSelectors(contentDoc);
+    rewrittenContent = contentDoc.body.innerHTML || rawComp;
+  }
+
+  // A composition file may ship a baked inline runtime (from a prior export:
+  // data-hyperframes-runtime / __hyperframeRuntime…). The studio injects its own
+  // preview runtime below, so strip the baked one from the body — otherwise it's
+  // double-loaded AND the baked inline copy can fail to parse inline (the
+  // "Unexpected token '<'" SyntaxError seen on comps with a baked runtime).
+  rewrittenContent = stripEmbeddedRuntimeScripts(rewrittenContent);
+  const { document: scriptsDoc } = parseHTML(
+    `<!DOCTYPE html><html><head></head><body>${rewrittenContent}</body></html>`,
+  );
+  deferScriptsUntilFonts(scriptsDoc as unknown as Document);
+  chargeMountsTheBrowserFetches(projectDir, scriptsDoc as unknown as Document);
+  rewrittenContent = scriptsDoc.body.innerHTML;
+
+  // The comp's root carries data-composition-id but (unlike inlined sub-comps,
+  // which inlineSubCompositions tags) no data-composition-file. Without it the
+  // studio can't resolve which file this comp's top-level elements live in and
+  // falls back to "index.html" — so the GSAP panel parses the project root (which
+  // may be a multi-timeline master) and wrongly reports "multiple timelines",
+  // disabling editing for a single-timeline comp. Tag the root with its own path.
+  rewrittenContent = tagRootCompositionFile(rewrittenContent, compPath);
+
+  // Use the project's index.html <head> to preserve all dependencies
+  const indexPath = resolveWithinProject(projectDir, "index.html");
+  let headContent = "";
+
+  if (indexPath && existsSync(indexPath))
+    headContent = rootHeadContent(readFileSync(indexPath, "utf-8"));
+
+  // Inject <base> for relative asset resolution (before other tags)
+  if (baseHref && !hasBaseElement(headContent)) {
+    headContent = `<base href="${baseHref}">\n${headContent}`;
+  }
+
+  // Append the sub-composition's own <head> content so its CSS, scripts,
+  // links, and meta tags are preserved. Placed after the project head so
+  // the composition's deps take precedence (last-write-wins for scripts).
+  if (compHeadContent) headContent += `\n${compHeadContent}`;
+  if (baseHref) {
+    headContent = withRootPathsRelative(headContent, baseHref);
+    rewrittenContent = withRootPathsRelative(rewrittenContent, baseHref);
+  }
+
+  // Strip any baked runtime the borrowed index/comp <head> carried, for the same
+  // reason as the body above — done before injecting the preview runtime so the
+  // injected tag (added next) is never removed.
+  headContent = stripEmbeddedRuntimeScripts(headContent);
+
+  headContent += `\n<script ${RUNTIME_BOOTSTRAP_ATTR}="1" src="${runtimeUrl}"></script>`;
+
+  // Fallback: if no index.html head was found, add minimal deps
+  if (!htmlHasGsapCore(headContent)) {
+    const core = `<script src="${gsapCdnDist(undefined, gsapBaseUrl).replace(/&/g, "&amp;")}gsap.min.js"></script>`;
+    headContent = insertGsapCoreBeforeHeadPlugin(headContent, core) ?? `${headContent}\n${core}`;
+  }
+
+  const htmlOpen = htmlAttrs ? `<html ${htmlAttrs}>` : "<html>";
+  const bodyOpen = bodyAttrs ? `<body ${bodyAttrs}>` : "<body>";
+
+  return `<!DOCTYPE html>
+${htmlOpen}
+<head>
+${headContent}
+</head>
+${bodyOpen}
+${TIMELINE_REGISTRY_SCRIPT}
+${rewrittenContent}
+</body>
+</html>`;
+}
+
+function mountedFileBytes(projectDir: string, src: string): number {
+  const file = resolveWithinProject(projectDir, decodedUrlPath(src));
+  if (!file) return 0;
+  assertCompositionFileSize(file, src);
+  try {
+    const stats = statSync(file);
+    return stats.isFile() ? stats.size : 0;
+  } catch {
+    return 0;
+  }
+}
+
+function chargeMountsTheBrowserFetches(projectDir: string, doc: Document): void {
+  const budget = new CompositionExpansionBudget();
+  const bytesBySrc = new Map<string, number>();
+  for (const host of doc.querySelectorAll("[data-composition-src]")) {
+    const src = host.getAttribute("data-composition-src") ?? "";
+    let bytes = bytesBySrc.get(src);
+    if (bytes === undefined) {
+      bytes = mountedFileBytes(projectDir, src);
+      bytesBySrc.set(src, bytes);
+    }
+    budget.charge(src, bytes);
+  }
+}
+
+/** True for a real `<base>` element; the text "<base" inside a script or comment does not count. */
+export function hasBaseElement(html: string): boolean {
+  return findStartTags(html, "base").length > 0;
+}
