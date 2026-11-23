@@ -68,16 +68,16 @@ CHUNKS = [
         "and MetaTrader five, with the first payout after fourteen days and a minimum payout of one hundred "
         "dollars. There's also an optional add-on that raises your profit split from eighty percent to a "
         "full hundred percent.")),
-    dict(id="c08_dashboard", slides=[("11_dashboard_home.png", 0.5), ("12_objectives.png", 0.5)], text=(
-        "So what do you actually see when you start? Let me walk you through it. The home tab shows your "
-        "balance, equity and open profit, all updating live as prices move. Pinned permanently on that page "
-        "is your permitted loss, the maximum and today's figure, so you never have to go hunting for the "
-        "number that matters most. Below that, the trading objectives: minimum trading days, profit target, "
-        "daily drawdown and max drawdown, each one showing the target, your result, and the actual floor in "
-        "dollars. Trading history is its own tab, open and closed trades, win rate, and performance over "
-        "time. That's your evidence if a dispute ever comes up, and it's on your side of the table. And you "
-        "can trade straight from the Match-Trader interface without leaving the dashboard, in both dark "
-        "and light themes. Everything updates automatically, no refresh-and-hope routine.")),
+    dict(id="c08_dashboard", slides=[("@clip:dashboard_demo", 0.5), ("12_objectives.png", 0.5)], text=(
+        "So what do you actually see when you start? Let me walk you through it, live on screen. This is the "
+        "real trader dashboard on app.everfunded.com, on an active one hundred thousand dollar 2-Step Phase "
+        "one account. Right at the top you've got your account identity, the plan type and your two loss "
+        "numbers. Under Risk Floors you can watch your static maximum loss anchored to the ninety thousand "
+        "dollar floor, and your daily loss limit with its reset timer. Under Progress and Timelimits sits "
+        "your profit target with the amount still to go, your qualifying days counter, and the inactivity "
+        "rule. Scroll down and you've got your balance and equity curve with the target lines drawn in, "
+        "analytics on what's making and costing you money, and the full trade history. And you can jump "
+        "straight into Match-Trader from the same page, without leaving the dashboard.")),
     dict(id="c09_pick", slides=[("13_pick.png", 1.0)], text=(
         "So which one would I pick? Honestly, if I were starting today, I'd go with the 2-Step on a size I "
         "can actually trade well. The wider daily and overall loss limits give you room to have a bad day "

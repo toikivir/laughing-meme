@@ -12,6 +12,7 @@ from PIL import Image, ImageDraw, ImageFont
 # ------------------------------------------------------------------ tokens --
 W, H = 1920, 1080
 FONT_DIR = os.path.join(os.path.dirname(os.path.abspath(__file__)), "..", "assets", "fonts")
+CAP_DIR = os.path.join(os.path.dirname(os.path.abspath(__file__)), "..", "assets", "captures")
 _F: dict = {}
 
 
@@ -168,35 +169,18 @@ def s_agenda():
 
 def s_overview():
     img = canvas(); d = ImageDraw.Draw(img, "RGBA")
-    header(d, "The three routes", "Same firm, three very different structures")
-    cols = [("2-STEP", GREEN, "Structured evaluation",
-             [("Phases", "2 phases"), ("Profit target", "8% then 5%"), ("Max daily loss", "5%"),
-              ("Max overall loss", "10% static"), ("Qualifying days", "3 per phase"), ("Deadline", "None")],
-             "Wider loss limits, two phases to pass"),
-            ("1-STEP", TEAL, "Single-phase evaluation",
-             [("Phases", "1 phase"), ("Profit target", "10%"), ("Max daily loss", "3%"),
-              ("Max overall loss", "6% static"), ("Qualifying days", "3 total"), ("Deadline", "None")],
-             "Shortest path, tighter limits"),
-            ("INSTANT", PURPLE, "No evaluation",
-             [("Phases", "0 — funded day one"), ("Profit target", "None (funded)"), ("Max daily loss", "3%"),
-              ("Max overall loss", "6% trailing"), ("Qualifying days", "Not applicable"), ("Deadline", "None")],
-             "Start trading immediately")]
-    cw = (CONTENT_W - 80) // 3; x = MARGIN; y = 296; ch = 620
-    for name, col, tag, rows, foot in cols:
-        card(d, [x, y, x + cw, y + ch], outline=col, width=3, glow=(col[0], col[1], col[2], 60))
-        d.rectangle([x, y, x + cw, y + 8], fill=col)
-        d.text((x + 34, y + 32), name, font=font("space-grotesk-700", 50), fill=col)
-        d.text((x + 34, y + 100), tag, font=font("inter-500", 26), fill=TEXT)
-        hline(d, x + 34, x + cw - 34, y + 150)
-        ry = y + 172
-        for k, v in rows:
-            d.text((x + 34, ry), k, font=font("inter-400", 24), fill=MUTED)
-            vw, _ = measure(d, v, font("jetbrains-mono-700", 25))
-            d.text((x + cw - 34 - vw, ry - 2), v, font=font("jetbrains-mono-700", 25), fill=TEXT)
-            ry += 52
-        hline(d, x + 34, x + cw - 34, y + ch - 72)
-        para(d, (x + 34, y + ch - 58), foot, font("inter-500", 24), fill=col, max_w=cw - 68, leading=6)
-        x += cw + 40
+    header(d, "The three routes", "The real comparison, straight from everfunded.com")
+    box = [MARGIN, 256, W - MARGIN, 936]
+    browser_frame(d, box, "everfunded.com — choose your challenge")
+    cap = Image.open(os.path.join(CAP_DIR, "comparison_table.png")).convert("RGB")
+    ix0, iy0, ix1, iy1 = box[0] + 14, box[1] + 60, box[2] - 14, box[3] - 14
+    iw, ih = ix1 - ix0, iy1 - iy0
+    scale = min(iw / cap.width, ih / cap.height)
+    nw, nh = int(cap.width * scale), int(cap.height * scale)
+    cap = cap.resize((nw, nh), Image.LANCZOS)
+    img.paste(cap, (ix0 + (iw - nw) // 2, iy0 + (ih - nh) // 2))
+    d.text((MARGIN, 952), "Real capture of EverFunded's published comparison table — 2-Step phases shown.",
+           font=font("inter-400", 22), fill=FAINT)
     lower_third(d)
     return img
 
@@ -362,13 +346,21 @@ def s_dashboard(home=True):
     ix0, iy0, ix1, iy1 = box[0] + 14, box[1] + 60, box[2] - 14, box[3] - 14
     sw = 300
     d.rectangle([ix0, iy0, ix0 + sw, iy1], fill=(10, 15, 27))
-    my = iy0 + 24
-    for i, m in enumerate(["Home", "Trading objectives", "Trading history", "Payouts", "Platform", "Support"]):
+    # account card from the real dashboard
+    card(d, [ix0 + 18, iy0 + 18, ix0 + sw - 18, iy0 + 190], r=16, fill=PANEL_HI)
+    d.text((ix0 + 36, iy0 + 34), "EverFunded 2-Step", font=font("inter-600", 23), fill=TEXT)
+    d.text((ix0 + 36, iy0 + 66), "#30005", font=font("jetbrains-mono-400", 21), fill=MUTED)
+    chip(d, (ix0 + 36, iy0 + 100), "MAX LOSS", font("oswald-600", 17), fg=RED, bg=(60, 22, 22))
+    chip(d, (ix0 + 160, iy0 + 100), "DAILY LOSS", font("oswald-600", 17), fg=GOLD, bg=(58, 42, 16))
+    d.text((ix0 + 36, iy0 + 140), "2-STEP · PHASE 1 · $100K", font=font("jetbrains-mono-700", 18), fill=GREEN_HI)
+    my = iy0 + 210
+    for i, m in enumerate(["Dashboard", "Accounts", "Payouts", "Rewards",
+                           "Certificates", "Contracts", "Billing", "Settings"]):
         act = (i == 0) if home else (i == 1)
         if act:
-            d.rectangle([ix0 + 14, my - 6, ix0 + sw - 14, my + 40], fill=(24, 52, 40))
-        d.text((ix0 + 34, my), m, font=font("inter-500", 24), fill=GREEN_HI if act else MUTED)
-        my += 52
+            d.rectangle([ix0 + 14, my - 6, ix0 + sw - 14, my + 38], fill=(24, 52, 40))
+        d.text((ix0 + 34, my), m, font=font("inter-500", 22), fill=GREEN_HI if act else MUTED)
+        my += 42
     cx = ix0 + sw + 30
     if home:
         cw = (ix1 - cx - 48) // 3
@@ -396,27 +388,42 @@ def s_dashboard(home=True):
             d.text((x + 20, oy + 52), tgt, font=font("jetbrains-mono-700", 30), fill=TEXT)
             d.text((x + 20, oy + 108), res, font=font("jetbrains-mono-400", 23), fill=GREEN_HI)
     else:
-        cw2 = (ix1 - cx - 24) // 2
-        for i, (lab, tgt, res, sub) in enumerate([
-                ("Minimum trading days", "3 days", "1 / 3", "phase 1"),
-                ("Profit target", "$8,000", "$1,240.50", "phase 1"),
-                ("Daily drawdown", "$95,000 floor", "$101,240.50", "today's equity"),
-                ("Maximum drawdown", "$90,000 floor", "static", "initial balance")]):
-            x = cx + (i % 2) * (cw2 + 24); y = iy0 + (i // 2) * 188
-            card(d, [x, y, x + cw2, y + 168])
-            d.text((x + 26, y + 20), lab.upper(), font=font("oswald-600", 23), fill=MUTED)
-            d.text((x + 26, y + 62), tgt, font=font("jetbrains-mono-700", 36), fill=TEXT)
-            d.text((x + 26, y + 116), res, font=font("jetbrains-mono-700", 29), fill=GREEN_HI)
-            rw_, _ = measure(d, res, font("jetbrains-mono-700", 29))
-            d.text((x + 38 + rw_, y + 124), sub, font=font("inter-400", 23), fill=FAINT)
-        hy = iy0 + 398
-        card(d, [cx, hy, ix1, hy + 186])
-        d.text((cx + 26, hy + 18), "TRADING HISTORY", font=font("oswald-600", 25), fill=MUTED)
-        sx = cx + 26
-        for lab, val in [("Total trades", "42"), ("Win rate", "61%"), ("Profit factor", "1.8")]:
-            d.text((sx, hy + 66), val, font=font("jetbrains-mono-700", 38), fill=TEXT)
-            d.text((sx, hy + 120), lab, font=font("inter-400", 23), fill=MUTED)
-            sx += 320
+        # faithful reproduction of the labels and values on the real dashboard
+        pw = (ix1 - cx - 24) // 2
+        card(d, [cx, iy0, cx + pw, iy0 + 158], fill=(40, 26, 26), outline=RED, width=2)
+        d.text((cx + 24, iy0 + 16), "RISK FLOORS", font=font("oswald-600", 22), fill=RED)
+        d.text((cx + 24, iy0 + 56), "Static max loss", font=font("inter-400", 21), fill=MUTED)
+        d.text((cx + 24, iy0 + 84), "$0 / $10,000", font=font("jetbrains-mono-700", 28), fill=TEXT)
+        d.text((cx + 250, iy0 + 92), "($90,000 floor)", font=font("inter-400", 21), fill=GOLD)
+        d.text((cx + 24, iy0 + 124), "Daily loss  $0 / $5,000", font=font("jetbrains-mono-400", 21), fill=MUTED)
+        px2 = cx + pw + 24
+        card(d, [px2, iy0, ix1, iy0 + 158])
+        d.text((px2 + 24, iy0 + 16), "PROGRESS & TIMELIMITS", font=font("oswald-600", 22), fill=GREEN_HI)
+        d.text((px2 + 24, iy0 + 56), "Profit target", font=font("inter-400", 21), fill=MUTED)
+        d.text((px2 + 24, iy0 + 84), "$0 / $8,000", font=font("jetbrains-mono-700", 28), fill=TEXT)
+        d.text((px2 + 250, iy0 + 92), "NOT REACHED", font=font("inter-500", 20), fill=RED)
+        d.text((px2 + 24, iy0 + 124), "Min days  0 / 3   (≥ $500 / day)", font=font("jetbrains-mono-400", 21), fill=MUTED)
+        sy = iy0 + 176
+        card(d, [cx, sy, ix1, sy + 96])
+        stats = [("INITIAL BALANCE", "$100,000", TEXT), ("PROFIT TARGET", "$8,000", GREEN_HI),
+                 ("MIN TRADING DAYS", "3", TEXT), ("PEAK EQUITY", "$100,000", TEAL),
+                 ("TROUGH", "$100,000", MUTED)]
+        sw2 = (ix1 - cx - 4 * 18) // 5
+        for i, (lab, val, col) in enumerate(stats):
+            x = cx + i * (sw2 + 18)
+            d.text((x, sy + 16), lab, font=font("oswald-600", 17), fill=MUTED)
+            d.text((x, sy + 46), val, font=font("jetbrains-mono-700", 24), fill=col)
+        ty = sy + 114
+        card(d, [cx, ty, ix1, ty + 96])
+        tl = [("BALANCE", "$100,000"), ("EQUITY", "$100,000"), ("TODAY'S P&L", "$0"),
+              ("DAILY LOSS RESET", "10h 48m 53s"), ("INACTIVITY", "0 / 30 days")]
+        tw2 = (ix1 - cx - 4 * 18) // 5
+        for i, (lab, val) in enumerate(tl):
+            x = cx + i * (tw2 + 18)
+            d.text((x, ty + 16), lab, font=font("oswald-600", 17), fill=MUTED)
+            d.text((x, ty + 46), val, font=font("jetbrains-mono-700", 22), fill=TEXT)
+        d.text((cx, 756), "Labels and values reproduced from EverFunded's published trader dashboard.",
+               font=font("inter-400", 20), fill=FAINT)
     lower_third(d)
     return img
 
@@ -455,11 +462,19 @@ def s_cta():
     card(d, [MARGIN, 376, 900, 552], outline=GREEN, width=4, glow=(34, 197, 94, 70))
     d.text((MARGIN + 40, 404), "USE CODE AT CHECKOUT", font=font("oswald-600", 25), fill=MUTED)
     d.text((MARGIN + 40, 444), "GEOID", font=font("oswald-700", 92), fill=GREEN_HI)
-    para(d, (960, 392), "Pick the challenge that fits your trading style through the link below, review "
-                        "the rules, and choose the option that fits how you actually trade.",
-         font("inter-400", 31), fill=TEXT, max_w=780)
-    d.text((960, 512), "everfunded.com", font=font("jetbrains-mono-700", 42), fill=TEAL)
-    x = MARGIN; y = 656; cw = (CONTENT_W - 80) // 3
+    # real checkout capture (code already applied)
+    cap = Image.open(os.path.join(CAP_DIR, "checkout_panel.png")).convert("RGB")
+    cw_, ch_ = 850, int(850 * cap.height / cap.width)
+    cap = cap.resize((cw_, ch_), Image.LANCZOS)
+    cbox = [950, 252, 950 + cw_, 252 + ch_]
+    card(d, cbox, r=14, fill=(9, 13, 24))
+    img.paste(cap, (cbox[0] + 8, cbox[1] + 8))
+    chip(d, (950, 214), "REAL CHECKOUT — CODE APPLIED", font("oswald-600", 21), fg=GREEN_HI,
+         bg=(20, 60, 40))
+    d.text((950, cbox[3] + 18), "List price $562.50  →  total to pay $281.25",
+           font=font("jetbrains-mono-400", 25), fill=MUTED)
+    d.text((950, cbox[3] + 54), "everfunded.com/checkout", font=font("jetbrains-mono-700", 30), fill=TEAL)
+    x = MARGIN; y = 700; cw = (CONTENT_W - 80) // 3
     for n, t in [("1", "Open the link in the description"),
                  ("2", "Compare 2-Step, 1-Step and Instant"),
                  ("3", "Apply GEOID at checkout — 50% off")]:

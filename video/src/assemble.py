@@ -238,20 +238,30 @@ def main():
         for name, w in blk["slides"]:
             sd = blk["seg"] * (w / sw)
             s0, s1 = t0, t0 + sd
-            img = os.path.join(SLIDES, name)
             seg_path = os.path.join(WORK, f"seg_{idx:03d}.mp4")
             ev = [(max(a, s0) - s0, min(b, s1) - s0, tx)
                   for a, b, tx in blk.get("caps", []) if b > s0 and a < s1]
             ass_p = os.path.join(WORK, f"cap_{idx:03d}.ass")
             build_ass(ev, ass_p)
-            vf = (f"zoompan=z='min(zoom+0.0009,1.07)':x='iw/2-(iw/zoom/2)':y='ih/2-(ih/zoom/2)'"
-                  f":d=1:s=1920x1080:fps={FPS},format=yuv420p"
-                  f",ass={ass_p}:fontsdir={FONT_DIR}")
-            if not (os.path.exists(seg_path) and os.path.getsize(seg_path) > 10000):
-                sh(["ffmpeg", "-y", "-loglevel", "error", "-loop", "1", "-i", img, "-t", f"{sd:.3f}",
-                    "-vf", vf, "-c:v", "libx264", "-preset", "veryfast", "-crf", str(CRF),
-                    "-maxrate", MAXRATE, "-bufsize", "5200k", "-pix_fmt", "yuv420p",
-                    "-r", str(FPS), "-an", seg_path])
+            if name.startswith("@clip:"):
+                # real screen-capture footage from video/assets/captures/<name>.mp4
+                src = os.path.join(ROOT, "video", "assets", "captures", f"{name[6:]}.mp4")
+                vf = f"scale=1920:1080,format=yuv420p,ass={ass_p}:fontsdir={FONT_DIR}"
+                if not (os.path.exists(seg_path) and os.path.getsize(seg_path) > 10000):
+                    sh(["ffmpeg", "-y", "-loglevel", "error", "-i", src, "-t", f"{sd:.3f}",
+                        "-vf", vf, "-c:v", "libx264", "-preset", "veryfast", "-crf", str(CRF),
+                        "-maxrate", MAXRATE, "-bufsize", "5200k", "-pix_fmt", "yuv420p",
+                        "-r", str(FPS), "-an", seg_path])
+            else:
+                img = os.path.join(SLIDES, name)
+                vf = (f"zoompan=z='min(zoom+0.0009,1.07)':x='iw/2-(iw/zoom/2)':y='ih/2-(ih/zoom/2)'"
+                      f":d=1:s=1920x1080:fps={FPS},format=yuv420p"
+                      f",ass={ass_p}:fontsdir={FONT_DIR}")
+                if not (os.path.exists(seg_path) and os.path.getsize(seg_path) > 10000):
+                    sh(["ffmpeg", "-y", "-loglevel", "error", "-loop", "1", "-i", img, "-t", f"{sd:.3f}",
+                        "-vf", vf, "-c:v", "libx264", "-preset", "veryfast", "-crf", str(CRF),
+                        "-maxrate", MAXRATE, "-bufsize", "5200k", "-pix_fmt", "yuv420p",
+                        "-r", str(FPS), "-an", seg_path])
             seg_files.append(seg_path)
             t0 = s1
             idx += 1
