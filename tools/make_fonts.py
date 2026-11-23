@@ -1,5 +1,6 @@
 """Install display fonts from npm (@fontsource) and convert woff2 -> ttf into the repo."""
 import os
+import shutil
 import subprocess
 import sys
 
@@ -35,6 +36,14 @@ def main():
                 continue
             woff2.decompress(src, dst)
             print("ok", os.path.basename(dst))
+    # also install system-wide so ffmpeg/libass (captions) can resolve them by name
+    sysdir = "/usr/local/share/fonts/vidzeditor"
+    os.makedirs(sysdir, exist_ok=True)
+    for f in os.listdir(OUT):
+        if f.endswith(".ttf"):
+            shutil.copy2(os.path.join(OUT, f), os.path.join(sysdir, f))
+    if shutil.which("fc-cache"):
+        subprocess.run(["fc-cache", "-f", sysdir], capture_output=True)
     return 0
 
 

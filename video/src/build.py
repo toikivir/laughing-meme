@@ -109,9 +109,14 @@ def header(d, kicker, title, accent=GREEN, y=84):
 
 
 def lower_third(d):
-    rr(d, [MARGIN, H - 96, MARGIN + 400, H - 40], 12, fill=(10, 14, 26, 215), outline=GREEN, width=2)
-    d.text((MARGIN + 20, H - 88), "GEOID", font=font("oswald-700", 30), fill=GREEN_HI)
-    d.text((MARGIN + 132, H - 76), "EVERFUNDED · ACCOUNT COMPARISON", font=font("inter-500", 19), fill=MUTED)
+    """Compact channel badge, top-right — keeps the caption zone clear."""
+    label = "GEOID"
+    f = font("oswald-700", 26)
+    tw, th = measure(d, label, f)
+    w = tw + 56
+    x1 = W - MARGIN
+    rr(d, [x1 - w, 40, x1, 40 + th + 26], 12, fill=(10, 14, 26, 215), outline=GREEN, width=2)
+    d.text((x1 - w + 28, 40 + 13), label, font=f, fill=GREEN_HI)
 
 
 def blobs(d, specs):
@@ -378,13 +383,13 @@ def s_dashboard(home=True):
         card(d, [cx, py, ix1, py + 116], fill=(40, 26, 26), outline=RED, width=2)
         d.text((cx + 26, py + 18), "PERMITTED LOSS", font=font("oswald-600", 23), fill=RED)
         d.text((cx + 26, py + 58), "Max  $90,000", font=font("jetbrains-mono-700", 33), fill=TEXT)
-        d.text((cx + 330, py + 58), "Today  $95,000", font=font("jetbrains-mono-700", 33), fill=GOLD)
+        d.text((cx + 330, py + 58), "Daily floor  $95,000", font=font("jetbrains-mono-700", 30), fill=GOLD)
         oy = py + 146
         ow = (ix1 - cx - 48) // 4
         for i, (lab, tgt, res) in enumerate([("Min trading days", "3", "0 / 3"),
                                              ("Profit target", "$8,000", "$1,240"),
-                                             ("Daily drawdown", "$95,000", "ok"),
-                                             ("Max drawdown", "$90,000", "ok")]):
+                                             ("Daily drawdown", "$95,000 floor", "safe"),
+                                             ("Max drawdown", "$90,000 floor", "safe")]):
             x = cx + i * (ow + 16)
             card(d, [x, oy, x + ow, oy + 168])
             d.text((x + 20, oy + 16), lab.upper(), font=font("oswald-600", 21), fill=MUTED)
